@@ -1,0 +1,604 @@
+#include "LoadingLayer.h"
+
+#include "Core/Application.h"
+#include "Core/Renderer/Renderer2D.h"
+#include "Core/Renderer/RenderCommand.h"
+#include "Core/Renderer/Renderer.h"
+#include "Core/Renderer/Shader.h"
+
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+
+#include <imgui.h>
+#include <implot.h>
+
+#include "Core/Core/UUID.h"
+
+#include <print>
+#include <cstdint>
+#include <string>
+
+// Global score
+int score = 0;
+
+LoadingLayer::LoadingLayer()
+{
+	Core::Application::Get().GetSpecification().UseDockspace = false;
+
+	Renderer::RenderCommand::Init();
+	Renderer::Renderer2D::Init();
+
+	std::thread([&]() {
+		glfwMakeContextCurrent(Core::Application::Get().GetWindow()->GetContextHandle());
+		std::println("started loading on worker thread");
+		std::println("finished loading on worker thread");
+		glfwMakeContextCurrent(NULL);
+		}).detach();
+
+	// 1. Load Shaders
+	m_BloomShader = Renderer::Shader::Create("assets/shaders/BallBloom.glsl");
+	m_UIShader = Renderer::Shader::Create("assets/shaders/UI_shader.glsl");
+
+	// 2. Setup "Uber" Vertex Array
+	{
+		m_BloomVA = Renderer::VertexArray::Create();
+
+		struct UberVertex {
+			glm::vec3 Position;
+			glm::vec2 TexCoord;
+			glm::vec4 Color;
+			float TexIndex;
+			glm::vec4 DataFirst;
+			glm::vec4 DataSecond;
+		};
+
+		UberVertex vertices[4];
+		memset(vertices, 0, sizeof(vertices));
+
+		vertices[0].TexCoord = { 0.0f, 0.0f };
+		vertices[1].TexCoord = { 1.0f, 0.0f };
+		vertices[2].TexCoord = { 1.0f, 1.0f };
+		vertices[3].TexCoord = { 0.0f, 1.0f };
+
+		m_BloomVB = Renderer::VertexBuffer::Create(sizeof(vertices));
+
+		m_BloomVB->SetLayout({
+			{ Renderer::ShaderDataType::Float3, "a_Position" },
+			{ Renderer::ShaderDataType::Float2, "a_TexCoord" },
+			{ Renderer::ShaderDataType::Float4, "a_Color" },
+			{ Renderer::ShaderDataType::Float,  "a_TexIndex" },
+			{ Renderer::ShaderDataType::Float4, "a_DataFirst" },
+			{ Renderer::ShaderDataType::Float4, "a_DataSecond" }
+			});
+
+		m_BloomVB->SetData(vertices, sizeof(vertices));
+		m_BloomVA->AddVertexBuffer(m_BloomVB);
+
+		uint32_t indices[6] = { 0,1,2, 2,3,0 };
+		m_BloomIB = Renderer::IndexBuffer::Create(indices, 6);
+		m_BloomVA->SetIndexBuffer(m_BloomIB);
+	}
+
+	// 3. Camera Setup
+	float orthoSize = 2.0f;
+	float aspectRatio = 1920.0f / 1080.0f;
+	float orthoHalfHeight = orthoSize * 0.5f;
+	float orthoHalfWidth = orthoHalfHeight * aspectRatio;
+
+	m_Camera.SetViewportSize(1920, 1080);
+	m_Camera.SetOrthographic(orthoSize, -1.0f, 1.0f);
+
+	// Boundaries for Physics
+	const float TOP_BOUND = orthoHalfHeight;
+	const float BOTTOM_BOUND = -orthoHalfHeight;
+	const float LEFT_BOUND = -orthoHalfWidth;
+	const float RIGHT_BOUND = orthoHalfWidth;
+
+	Renderer::Renderer2D::SetLineWidth(1.0f);
+
+	// 4. ECS Setup
+	m_World.component<Transform>();
+	m_World.component<Velocity>();
+	m_World.component<Color>();
+	m_World.component<Core::UUID>();
+	m_World.component<UITransform>();
+	m_World.component<UIText>();
+
+	// Register Tags and New Components
+	m_World.component<PlayerTag>();
+	m_World.component<EnemyTag>();
+	m_World.component<BallTag>();
+	m_World.component<PlayerAbilities>();
+	m_World.component<BallState>();
+
+	// --- Game Entities ---
+
+	// Player
+	m_World.entity("Player")
+		.add<PlayerTag>()
+		.set<Transform>({ {-1.5f, 0.0f}, {0.05f, 0.3f} })
+		.set<Velocity>({ {0.0f, 0.0f} })
+		.set<Color>({ {1.0f, 1.0f, 1.0f, 1.0f} })
+		.set<PlayerAbilities>({ false, 0.0f, 0.0f, 5.0f, 8.0f, false, 0.0f, 3.0f })
+		.set<Core::UUID>({ Core::UUID() });
+
+	// Enemy
+	m_World.entity("Enemy")
+		.add<EnemyTag>()
+		.set<Transform>({ {1.5f, 0.0f}, {0.05f, 0.3f} })
+		.set<Velocity>({ {0.0f, 0.0f} }) // Needs Velocity for movement system!
+		.set<Color>({ {1.0f, 1.0f, 1.0f, 1.0f} })
+		.set<Core::UUID>({ Core::UUID() });
+
+	// Ball
+	m_World.entity("Ball")
+		.add<BallTag>()
+		.set<Transform>({ {0.0f, 0.0f}, {0.05f, 0.05f} })
+		.set<Velocity>({ {0.8f, 0.4f} })
+		.set<Color>({ {1.0f, 0.0f, 0.0f, 1.0f} })
+		.set<BallState>({ false })
+		.set<Core::UUID>({ Core::UUID() });
+
+	// --- UI Entities ---
+	m_World.entity("ScoreUI")
+		.set<UITransform>({ {-0.25f, -0.95f}, {0.5f, 0.15f} })
+		.set<Color>({ {0.0f, 0.2f, 0.3f, 1.0f} })
+		.set<UIText>({ "Score: 0", 0.1f })
+		.add<ClickableUI>()
+		.add<UIScore>()
+		.set<UIClickAction>({ []() { score++; } })
+		.set<Core::UUID>({ Core::UUID() });
+
+	m_World.entity("Ability_Q")
+		.set<UITransform>({ {-1.6f, -0.9f}, {0.2f, 0.2f} })
+		.set<Color>({ {0.0f, 0.8f, 0.8f, 1.0f} })
+		.add<ClickableUI>()
+		.set<UIText>({ "Q", 0.12f })
+		.set<UIClickAction>({ [this]() {
+			m_World.query<PlayerAbilities>().each([](PlayerAbilities& ab) {
+				if (ab.BigCooldownTimer <= 0.0f) {
+					ab.IsBigActive = true;
+					ab.BigDurationTimer = ab.BigDurationMax;
+					ab.BigCooldownTimer = ab.BigCooldownMax;
+				}
+			});
+		} })
+		.set<Core::UUID>({ Core::UUID() });
+
+	m_World.entity("Ability_E")
+		.set<UITransform>({ {-1.3f, -0.9f}, {0.2f, 0.2f} })
+		.set<Color>({ {0.8f, 0.4f, 0.0f, 1.0f} })
+		.set<UIText>({ "E", 0.12f })
+		.set<UIClickAction>({ [this]() {
+			m_World.query<PlayerAbilities>().each([](PlayerAbilities& ab) {
+				if (ab.PowerCooldownTimer <= 0.0f) {
+					ab.IsPowerShotCharged = true;
+					ab.PowerCooldownTimer = ab.PowerCooldownMax;
+				}
+			});
+		} })
+		.add<ClickableUI>()
+		.set<Core::UUID>({ Core::UUID() });
+
+
+	// --- SYSTEMS ---
+
+	// 1. Ability Logic (Visuals & Timers)
+	m_World.system<PlayerAbilities, Transform, Color>("PlayerAbilityLogic")
+		.each([&](flecs::entity e, PlayerAbilities& ab, Transform& t, Color& c) {
+		float dt = m_CurrentDeltaTime;
+
+		if (ab.IsBigActive) {
+			t.Size.y = glm::mix(t.Size.y, 0.6f, 10.0f * dt);
+			ab.BigDurationTimer -= dt;
+			if (ab.BigDurationTimer <= 0.0f) ab.IsBigActive = false;
+		}
+		else {
+			t.Size.y = glm::mix(t.Size.y, 0.3f, 10.0f * dt);
+		}
+
+		if (ab.BigCooldownTimer > 0.0f) ab.BigCooldownTimer -= dt;
+		if (ab.PowerCooldownTimer > 0.0f) ab.PowerCooldownTimer -= dt;
+
+		if (ab.IsPowerShotCharged) {
+			float pulse = (sin(m_TotalTime * 15.0f) * 0.5f + 0.5f);
+			c.Value = glm::vec4(1.0f, 0.5f + (pulse * 0.5f), 0.0f, 1.0f);
+		}
+		else {
+			c.Value = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f);
+		}
+			});
+
+	// 2. Player Input (Sets Velocity)
+	m_World.system<Velocity, PlayerAbilities, PlayerTag>("PlayerInput")
+		.each([=, this](flecs::entity e, Velocity& v, PlayerAbilities& ab, PlayerTag& tag) {
+		GLFWwindow* window = (GLFWwindow*)Core::Application::Get().GetWindow()->GetHandle();
+
+		// Set Target Velocity
+		const float speed = 1.8f;
+		v.Value.y = 0.0f;
+
+		if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) v.Value.y = speed;
+		if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) v.Value.y = -speed;
+
+		// Ability Inputs
+		if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS) {
+			if (ab.BigCooldownTimer <= 0.0f) {
+				ab.IsBigActive = true;
+				ab.BigDurationTimer = ab.BigDurationMax;
+				ab.BigCooldownTimer = ab.BigCooldownMax;
+			}
+		}
+		if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS) {
+			if (ab.PowerCooldownTimer <= 0.0f && !ab.IsPowerShotCharged) {
+				ab.IsPowerShotCharged = true;
+				ab.PowerCooldownTimer = ab.PowerCooldownMax;
+			}
+		}
+			});
+
+	// 3. Enemy AI (Sets Velocity with Deadzone)
+	m_World.system<Transform, Velocity, EnemyTag>("EnemyAI")
+		.each([&](flecs::entity e, Transform& t, Velocity& v, EnemyTag& tag) {
+
+		const float speed = 1.5f;
+		const float deadzone = 0.05f; // Prevents jitter
+
+		glm::vec2 ballPos = { 0,0 };
+		m_World.query<Transform, BallTag>().each([&](Transform& bt, BallTag&) {
+			ballPos = bt.Position;
+			});
+
+		float diff = ballPos.y - t.Position.y;
+
+		// Move based on velocity if outside deadzone
+		if (std::abs(diff) > deadzone) {
+			if (diff > 0) v.Value.y = speed;
+			else v.Value.y = -speed;
+		}
+		else {
+			v.Value.y = 0.0f; // Stop moving
+		}
+			});
+
+	// 4. Paddle Physics System (Applies Velocity & Clamps Bounds)
+	// Matches entities with Transform + Velocity, but NOT the Ball (Ball has own logic)
+	m_World.system<Transform, Velocity>()
+		.with<BallTag>().not_() // Exclude Ball
+		.each([=](flecs::entity e, Transform& t, Velocity& v) {
+
+		float dt = m_CurrentDeltaTime;
+
+		// Apply Velocity
+		t.Position += v.Value * dt;
+
+		// Clamp Bounds
+		const float PADDLE_HALF = t.Size.y * 0.5f;
+		if (t.Position.y + PADDLE_HALF > TOP_BOUND) t.Position.y = TOP_BOUND - PADDLE_HALF;
+		else if (t.Position.y - PADDLE_HALF < BOTTOM_BOUND) t.Position.y = BOTTOM_BOUND + PADDLE_HALF;
+			});
+
+	// 5. Ball Movement & Wall Bounce
+	m_World.system<Transform, Velocity, BallState, BallTag>("BallLogic")
+		.each([=](flecs::entity e, Transform& t, Velocity& v, BallState& state, BallTag& tag) {
+		float dt = m_CurrentDeltaTime;
+		t.Position += v.Value * dt;
+
+		// Color Logic
+		if (state.IsPowered) e.set<Color>({ {1.0f, 0.0f, 1.0f, 1.0f} });
+		else e.set<Color>({ {1.0f, 0.0f, 0.0f, 1.0f} });
+
+		// Wall Bounces (Top/Bottom)
+		if (t.Position.y + t.Size.y * 0.5f > TOP_BOUND) {
+			t.Position.y = TOP_BOUND - t.Size.y * 0.5f;
+			v.Value.y = -v.Value.y;
+		}
+		else if (t.Position.y - t.Size.y * 0.5f < BOTTOM_BOUND) {
+			t.Position.y = BOTTOM_BOUND + t.Size.y * 0.5f;
+			v.Value.y = -v.Value.y;
+		}
+
+		// Reset Condition (Left/Right)
+		if (t.Position.x < LEFT_BOUND - 0.5f || t.Position.x > RIGHT_BOUND + 0.5f) {
+			t.Position = { 0.0f, 0.0f };
+			v.Value = { 0.8f, 0.4f }; // Reset Speed
+			state.IsPowered = false;
+			score = 0;
+		}
+			});
+
+	// 6. Collision System (Physics & Rebound)
+	auto intersects = [](const Transform& a, const Transform& b) {
+		return (a.Position.x - a.Size.x * 0.5f < b.Position.x + b.Size.x * 0.5f &&
+			a.Position.x + a.Size.x * 0.5f > b.Position.x - b.Size.x * 0.5f &&
+			a.Position.y - a.Size.y * 0.5f < b.Position.y + b.Size.y * 0.5f &&
+			a.Position.y + a.Size.y * 0.5f > b.Position.y - b.Size.y * 0.5f);
+		};
+
+	m_World.system<Transform, Velocity, BallState, BallTag>("CollisionSystem")
+		.each([=, this](flecs::entity ballEnt, Transform& ballT, Velocity& ballV, BallState& ballState, BallTag& bTag) {
+
+		// Player Collision
+		m_World.query<Transform, PlayerTag, PlayerAbilities>().each([&](flecs::entity pEnt, Transform& pT, PlayerTag& pTag, PlayerAbilities& pAb) {
+			if (intersects(ballT, pT)) {
+				// Calculate Angle
+				float relativeY = (ballT.Position.y - pT.Position.y) / (pT.Size.y * 0.5f);
+				glm::vec2 dir = glm::normalize(glm::vec2(1.0f, relativeY)); // Bounce Right
+
+				// Calculate Speed
+				float currentSpeed = glm::length(ballV.Value) * 1.05f; // Speed up
+				if (currentSpeed > 2.5f) currentSpeed = 2.5f; // Cap speed
+
+				if (pAb.IsPowerShotCharged) {
+					currentSpeed = 3.5f; // Super speed
+					ballState.IsPowered = true;
+					pAb.IsPowerShotCharged = false;
+				}
+
+				ballV.Value = dir * currentSpeed;
+
+				// Unstick
+				ballT.Position.x = pT.Position.x + (pT.Size.x + ballT.Size.x) * 0.5f + 0.01f;
+				score++;
+			}
+			});
+
+		// Enemy Collision
+		m_World.query<Transform, EnemyTag>().each([&](flecs::entity eEnt, Transform& eT, EnemyTag& eTag) {
+			if (intersects(ballT, eT)) {
+				// Calculate Angle
+				float relativeY = (ballT.Position.y - eT.Position.y) / (eT.Size.y * 0.5f);
+				glm::vec2 dir = glm::normalize(glm::vec2(-1.0f, relativeY)); // Bounce Left
+
+				float currentSpeed = glm::length(ballV.Value);
+				if (ballState.IsPowered) currentSpeed = 1.5f; // Reset if it was powered
+
+				ballV.Value = dir * currentSpeed;
+				ballState.IsPowered = false;
+
+				// Unstick
+				ballT.Position.x = eT.Position.x - (eT.Size.x + ballT.Size.x) * 0.5f - 0.01f;
+			}
+			});
+			});
+
+	// 7. UI Click System
+	m_World.system<UITransform, ClickableUI>("UIClickSystem")
+		.each([this](flecs::entity e, UITransform& ui, ClickableUI&) {
+		bool inside = mouseX >= ui.Pos.x && mouseX <= ui.Pos.x + ui.Size.x &&
+			mouseY >= ui.Pos.y && mouseY <= ui.Pos.y + ui.Size.y;
+
+		if (inside && mousePressed) {
+			if (e.has<UIClickAction>()) {
+				e.get<UIClickAction>().Callback();
+			}
+		}
+			});
+}
+
+LoadingLayer::~LoadingLayer() {}
+
+void LoadingLayer::OnUpdate(float ts)
+{
+	GLFWwindow* win = (GLFWwindow*)Core::Application::Get().GetWindow()->GetHandle();
+	glfwGetCursorPos(win, &mouseX, &mouseY);
+
+	// Normalize Mouse Coordinates
+	mouseX = (mouseX / 1920.0f) * 2.0f - 1.0f;
+	mouseY = -(mouseY / 1080.0f) * 2.0f + 1.0f;
+	mouseX *= (1920.0f / 1080.0f);
+
+	bool pressedNow = glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+	bool clicked = pressedNow && !mouseWasPressed;
+	mouseWasPressed = pressedNow;
+	mousePressed = clicked;
+
+	m_CurrentDeltaTime = ts;
+
+	if (!m_Paused) {
+		m_World.progress(ts);
+	}
+
+	m_TotalTime += ts;
+
+	// FPS Calc
+	float instantFPS = (ts > 0.0f) ? (1.0f / ts) : 0.0f;
+	m_FPSAccumulator += instantFPS;
+	m_FrameCount++;
+	if (m_FrameCount >= 30) {
+		m_FPS = m_FPSAccumulator / 30.0f;
+		m_FPSAccumulator = 0.0f;
+		m_FrameCount = 0;
+	}
+
+	if (glfwGetKey(win, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
+		Core::Application::Get().QueueEvent([&]() { TransitionTo<LoadingLayer>(); });
+	}
+}
+
+void LoadingLayer::OnRender()
+{
+	Renderer::Renderer2D::ResetStats();
+	Renderer::RenderCommand::SetClearColor({ 0.1f, 0.1f, 0.1f, 1.0f });
+	Renderer::RenderCommand::Clear();
+
+	Renderer::Renderer2D::BeginScene(m_Camera, glm::mat4(1.f));
+
+	// 1. Draw Game World
+	m_World.query<Transform, Color>().each([](flecs::entity e, Transform& t, Color& c) {
+		Renderer::Renderer2D::DrawQuad(glm::vec3(t.Position, 0.0f), t.Size, c.Value);
+		});
+
+	// 2. Draw Bloom (Ball Trail)
+	if (m_BloomShader && m_BloomVA)
+	{
+		m_World.query<Transform, Velocity, BallState, BallTag>().each([&](Transform& t, Velocity& v, BallState& bs, BallTag& e) {
+			m_BloomShader->Bind();
+
+			if (bs.IsPowered) {
+				m_BloomShader->SetFloat4("u_Color", { 1.0f, 0.0f, 1.0f, 1.0f });
+				m_BloomShader->SetFloat4("u_ColorSecondary", { 0.0f, 1.0f, 1.0f, 1.0f });
+				m_BloomShader->SetFloat("u_Size", 0.08f);
+			}
+			else {
+				m_BloomShader->SetFloat4("u_Color", { 1.0f, 1.0f, 1.0f, 1.0f });
+				m_BloomShader->SetFloat4("u_ColorSecondary", { 1.0f, 0.2f, 0.15f, 1.0f });
+				m_BloomShader->SetFloat("u_Size", 0.04f);
+			}
+
+			m_BloomShader->SetFloat2("u_Velocity", { v.Value.x, v.Value.y });
+			m_BloomShader->SetFloat("u_AlphaCutoff", 0.01f);
+			m_BloomShader->SetFloat("u_Time", m_TotalTime);
+			m_BloomShader->SetInt("u_ParticleCount", 32);
+			m_BloomShader->SetFloat("u_MaxRadius", 0.6f);
+			m_BloomShader->SetFloat("u_Speed", 0.8f);
+			m_BloomShader->SetFloat("u_Spread", 1.5f);
+			m_BloomShader->SetFloat("u_Seed", 0.37f);
+			m_BloomShader->SetFloat("u_CoreRadius", 0.1f);
+			m_BloomShader->SetFloat("u_GlowFalloff", 3.0f);
+
+			auto buildBloom = [](void* dst, const glm::mat4& transform, uint32_t firstVertex) -> uint32_t {
+				struct UberVertex {
+					glm::vec3 Position; glm::vec2 TexCoord; glm::vec4 Color; float TexIndex; glm::vec4 Data1; glm::vec4 Data2;
+				};
+				UberVertex* v = (UberVertex*)dst;
+				static const glm::vec3 positions[4] = { {-0.5f,-0.5f,0.f}, {0.5f,-0.5f,0.f}, {0.5f,0.5f,0.f}, {-0.5f,0.5f,0.f} };
+				static const glm::vec2 uvs[4] = { {0,0}, {1,0}, {1,1}, {0,1} };
+
+				for (int i = 0; i < 4; ++i) {
+					v[i].Position = glm::vec3(transform * glm::vec4(positions[i], 1.0f));
+					v[i].TexCoord = uvs[i];
+					v[i].Color = glm::vec4(0.0f);
+					v[i].TexIndex = 0.0f;
+					v[i].Data1 = glm::vec4(0.0f);
+					v[i].Data2 = glm::vec4(0.0f);
+				}
+				return 4;
+				};
+
+			glm::vec3 pos{ t.Position.x, t.Position.y, 0.0f };
+			glm::vec2 size{ t.Size.x + 1.f, t.Size.y + 1.f };
+
+			Renderer::Renderer2D::DrawMesh(pos, size, 0.0f, m_BloomVA, m_BloomShader, 6, buildBloom);
+			});
+	}
+
+	// 3. Draw UI
+	if (m_UIShader && m_BloomVA)
+	{
+		m_UIShader->Bind();
+		m_UIShader->SetFloat("u_Time", m_TotalTime);
+		m_UIShader->SetFloat("u_BorderWidth", 0.05f);
+		m_UIShader->SetFloat("u_CornerRadius", 0.2f);
+		m_UIShader->SetFloat("u_ShadowOffset", 0.08f);
+		m_UIShader->SetFloat("u_ShadowBlur", 0.15f);
+
+		PlayerAbilities* abilities = nullptr;
+		m_World.query<PlayerAbilities>().each([&](PlayerAbilities& a) { abilities = &a; });
+
+		m_World.query<UITransform, Color>().each([&](flecs::entity e, UITransform& ui, Color& c) {
+			bool isHovered = mouseX >= ui.Pos.x && mouseX <= ui.Pos.x + ui.Size.x &&
+				mouseY >= ui.Pos.y && mouseY <= ui.Pos.y + ui.Size.y;
+
+			glm::vec4 entityColor = c.Value;
+			glm::vec4 borderColor = { 1.0f, 1.0f, 1.0f, 1.0f };
+
+			if (strcmp(e.name(), "Ability_Q") == 0) {
+				if (abilities && abilities->BigCooldownTimer > 0.0f) entityColor *= 0.3f;
+				if (abilities && abilities->IsBigActive) borderColor = { 0.0f, 1.0f, 0.0f, 1.0f };
+			}
+			if (strcmp(e.name(), "Ability_E") == 0) {
+				if (abilities && abilities->PowerCooldownTimer > 0.0f) entityColor *= 0.3f;
+				if (abilities && abilities->IsPowerShotCharged) borderColor = { 1.0f, 0.0f, 0.0f, 1.0f };
+			}
+			entityColor.a = 1.0f;
+
+			auto buildUI = [=](void* dst, const glm::mat4& transform, uint32_t firstVertex) -> uint32_t {
+				struct UberVertex {
+					glm::vec3 Position; glm::vec2 TexCoord; glm::vec4 Color; float TexIndex; glm::vec4 Data1; glm::vec4 Data2;
+				};
+				UberVertex* v = (UberVertex*)dst;
+				static const glm::vec3 positions[4] = { {-0.5f,-0.5f,0.f}, {0.5f,-0.5f,0.f}, {0.5f,0.5f,0.f}, {-0.5f,0.5f,0.f} };
+				static const glm::vec2 uvs[4] = { {0,0}, {1,0}, {1,1}, {0,1} };
+
+				for (int i = 0; i < 4; ++i) {
+					v[i].Position = glm::vec3(transform * glm::vec4(positions[i], 1.0f));
+					v[i].TexCoord = uvs[i];
+					v[i].Color = entityColor;
+					v[i].TexIndex = 0.0f;
+					v[i].Data1 = glm::vec4(ui.Size.x, ui.Size.y, isHovered ? 1.0f : 0.0f, 0.0f);
+					v[i].Data2 = borderColor;
+				}
+				return 4;
+				};
+
+			glm::vec3 centerPos = { ui.Pos.x + ui.Size.x * 0.5f, ui.Pos.y + ui.Size.y * 0.5f, 0.1f };
+			Renderer::Renderer2D::DrawMesh(centerPos, { ui.Size.x , ui.Size.y }, 0.0f, m_BloomVA, m_UIShader, 6, buildUI);
+
+			if (e.has<UIText>()) {
+				const UIText& textComp = e.get<UIText>();
+				std::string textStr = textComp.Text;
+
+				if (e.has<UIScore>()) textStr = "Score: " + std::to_string(score);
+				if (abilities && strcmp(e.name(), "Ability_Q") == 0 && abilities->BigCooldownTimer > 0.0f)
+					textStr = std::to_string((int)abilities->BigCooldownTimer + 1);
+				if (abilities && strcmp(e.name(), "Ability_E") == 0 && abilities->PowerCooldownTimer > 0.0f)
+					textStr = std::to_string((int)abilities->PowerCooldownTimer + 1);
+
+				float estimatedWidth = textStr.length() * (textComp.Scale * 0.5f);
+				float estimatedHeight = textComp.Scale * 0.7f;
+				glm::vec3 textPos = centerPos;
+				textPos.z += 0.01f;
+				textPos.x -= estimatedWidth * 0.5f;
+				textPos.y -= estimatedHeight * 0.5f;
+
+				glm::mat4 textTransform = glm::translate(glm::mat4(1.0f), textPos) * glm::scale(glm::mat4(1.0f), glm::vec3(textComp.Scale));
+				Renderer::Renderer2D::DrawString(textStr, Renderer::Font::GetDefault(), textTransform, { textComp.Color });
+			}
+			});
+	}
+
+	Renderer::Renderer2D::EndScene();
+	RenderDevBar();
+	RenderEntityInspector();
+}
+
+void LoadingLayer::RenderDevBar()
+{
+	ImGuiViewport* viewport = ImGui::GetMainViewport();
+	ImGuiWindowFlags topBarFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoCollapse;
+	const float pad = 2.0f;
+	const float barHeight = 40.0f;
+
+	ImGui::SetNextWindowPos(ImVec2(viewport->Pos.x + pad, viewport->Pos.y + pad));
+	ImGui::SetNextWindowSize(ImVec2(viewport->Size.x - pad * 2.0f, barHeight));
+	ImGui::SetNextWindowViewport(viewport->ID);
+
+	ImGui::Begin("TopBar", nullptr, topBarFlags);
+	ImGui::BeginGroup();
+	{
+		if (ImGui::Button(m_Paused ? "Resume" : "Pause")) m_Paused = !m_Paused;
+		ImGui::SameLine(0, 20);
+		ImGui::Text("FPS: %.1f", m_FPS);
+		ImGui::SameLine();
+		ImGui::Checkbox("Entities", &m_ShowEntityInspector);
+	}
+	ImGui::EndGroup();
+	ImGui::End();
+}
+
+void LoadingLayer::RenderEntityInspector()
+{
+	if (!m_ShowEntityInspector) return;
+	ImGui::Begin("Inspector", &m_ShowEntityInspector);
+	m_World.query<Core::UUID>().each([&](flecs::entity e, Core::UUID& id) {
+		const char* nm = e.name();
+		std::string name = nm ? nm : "Entity";
+		if (ImGui::TreeNode(name.c_str())) {
+			if (e.has<Velocity>()) ImGui::DragFloat2("Velocity", (float*)&e.get_mut<Velocity>().Value, 0.01f);
+			if (e.has<Transform>()) ImGui::DragFloat2("Position", (float*)&e.get_mut<Transform>().Position, 0.01f);
+			ImGui::TreePop();
+		}
+		});
+	ImGui::End();
+}
